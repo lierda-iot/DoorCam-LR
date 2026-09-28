@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 This document records third-party source material, hardware files, and managed
-components used by AM36 Electronic Doorbell.
+components used by AM36-DoorCam.
 
 ## AM36 Hardware and Enclosure Files
 

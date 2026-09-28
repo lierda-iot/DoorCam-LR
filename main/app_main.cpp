@@ -378,6 +378,13 @@ void on_config_received(uint8_t key, uint32_t value)
     } else if (key == APP_CFG_KEY_INTERCOM) {
         ESP_LOGI(TAG, "config: intercom prepare session=%lu",
                  static_cast<unsigned long>(value));
+    } else if (key == APP_CFG_KEY_JPEG_QUALITY) {
+        // Clamped by the setter; store what was applied, not what was sent.
+        g_radio.image_xfer().set_jpeg_quality(
+            static_cast<uint8_t>(value > 255U ? 255U : value));
+        const uint8_t applied = g_radio.image_xfer().jpeg_quality();
+        save_config_u8("jpegq", applied);
+        ESP_LOGI(TAG, "config: jpeg_quality=%u", applied);
     } else {
         // Ignore unsupported configuration keys.
         ESP_LOGW(TAG, "config: key=%u not supported, ignored", key);
@@ -1465,6 +1472,14 @@ bool on_gw_low_power_change(uint32_t enable)
     return ok;
 }
 
+// Gateway UI: JPEG quality for the door station's encoder. Nothing to keep
+// here; the node stores it and the UI keeps its own copy for the badge.
+bool on_gw_jpeg_quality_change(uint32_t quality)
+{
+    ESP_LOGI(TAG, "UI JPEG quality: %lu", static_cast<unsigned long>(quality));
+    return g_radio.send_config(APP_CFG_KEY_JPEG_QUALITY, quality);
+}
+
 void on_button(bsp_btn_id_t id, bool pressed, void *user)
 {
     (void)user;
@@ -1665,8 +1680,11 @@ extern "C" void app_main(void)
             ESP_LOGI(TAG, "door-station role: radio initialized for image transfer");
             g_radio.set_pir_enabled(load_config_u8("pir", 0) != 0);
             g_low_power_enabled = load_config_u8("lowpwr", 0) != 0;
-            ESP_LOGI(TAG, "NVS: pir=%d lowpwr=%d",
-                     load_config_u8("pir", 0), g_low_power_enabled);
+            g_radio.image_xfer().set_jpeg_quality(
+                load_config_u8("jpegq", APP_IMAGE_JPEG_QUALITY));
+            ESP_LOGI(TAG, "NVS: pir=%d lowpwr=%d jpegq=%u",
+                     load_config_u8("pir", 0), g_low_power_enabled,
+                     g_radio.image_xfer().jpeg_quality());
 
 #if APP_INTERCOM_IMAGE_CAPTURE_PROBE_MS > 0
             // Optional capture-and-encode diagnostic below voice priority.
@@ -1749,6 +1767,7 @@ extern "C" void app_main(void)
                 }
                 ui_gw_set_pir_trigger_cb(on_gw_pir_trigger_change);
                 ui_gw_set_low_power_cb(on_gw_low_power_change);
+                ui_gw_set_jpeg_quality_cb(on_gw_jpeg_quality_change);
                 ui_gw_set_intercom_cb(on_gw_intercom_change);
                 ui_gw_set_rx_abort_cb(on_gw_rx_abort);
             }

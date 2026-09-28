@@ -91,11 +91,20 @@ esp_err_t bsp_audio_pa_enable(bool on);                  /* PA enable via P6 */
  * returns once samples reach the ring, not the speaker, so push at least this
  * much silence before cutting the PA. The depth differs per board role. */
 uint32_t  bsp_audio_tx_ring_ms(void);
+/* Release the I2S (camera capture needs its DMA) and bring it back. resume()
+ * also repairs a channel pair left half-built by a failed rebuild; it is a
+ * no-op while I2S is up. rebuild() tears down whatever is there, even a
+ * running pair, and builds it again at the current depth: the recovery for
+ * a reader that keeps failing. All three may be called from any task; a
+ * concurrent bsp_audio_read/write returns short and must be retried. */
 esp_err_t bsp_audio_suspend(void);
 esp_err_t bsp_audio_resume(void);
+esp_err_t bsp_audio_rebuild(void);
 /* Rebuild the duplex I2S at a new DMA ring depth (a shallow ring gives the
  * AEC a stable speaker-path latency during a call). No-op if the depth is
- * already active; if the I2S is released it is recorded for the next resume. */
+ * already active; if the I2S is released it is recorded for the next resume.
+ * If the new depth cannot be built the old one is restored and the error
+ * returned. */
 esp_err_t bsp_audio_set_dma_desc_num(uint32_t dma_desc_num);
 /* DAC output level: 0 mutes, BSP_AUDIO_VOLUME_MAX is the codec maximum. */
 #define BSP_AUDIO_VOLUME_MAX  120

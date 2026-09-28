@@ -24,6 +24,8 @@ typedef bool (*ui_gw_capture_cb_t)(void);
  * lands on the visitor page (see visitor_store_snapshot_add). */
 typedef bool (*ui_gw_pir_trigger_cb_t)(uint32_t enable);
 typedef bool (*ui_gw_low_power_cb_t)(uint32_t enable);
+/* JPEG quality for the node's encoder (APP_IMAGE_JPEG_QUALITY_MIN..MAX). */
+typedef bool (*ui_gw_jpeg_quality_cb_t)(uint32_t quality);
 /* Start (1) / end (0) the two-way call. Not a setting: the capture key dials
  * it as the second step of a session (see ui_gw_key_event) and the UI ends it
  * when the user steps back to listening or leaves the page. */
@@ -93,6 +95,7 @@ void ui_gw_note_unseen(void);
 void ui_gw_set_capture_cb(ui_gw_capture_cb_t cb);
 void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb);
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb);
+void ui_gw_set_jpeg_quality_cb(ui_gw_jpeg_quality_cb_t cb);
 void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb);
 void ui_gw_set_intercom_active(bool active);
 void ui_gw_set_rx_abort_cb(ui_gw_rx_abort_cb_t cb);

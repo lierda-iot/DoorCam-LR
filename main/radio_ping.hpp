@@ -216,9 +216,21 @@ private:
     void wait_for_jitter_buffer();
     void conceal_missing_frames(uint16_t seq, bool av_stream);
     bool read_mono_frame(int16_t *mono, size_t samples);
-    bool play_mono_frame(const int16_t *mono, size_t samples);
+    // Called by tx_task on every failed read: after a run of failures with
+    // nothing releasing the I2S, rebuilds it (the only path that would).
+    void note_mic_read_failure();
+    // pa_on false leaves the PA as it is: call fillers must not switch it back
+    // on after stop_intercom_local() has turned it off.
+    bool play_mono_frame(const int16_t *mono, size_t samples, bool pa_on = true);
     void set_playback_pa(bool on);
     void update_playback_timeout();
+    // Call playout keeper, play task only; see APP_INTERCOM_PLAYOUT_GUARD_MS.
+    // fill_wait() is how long the task may block for the next packet before
+    // the ring reaches the guard (portMAX_DELAY when no call is playing).
+    TickType_t intercom_fill_wait();
+    bool intercom_fill_due() const;
+    void intercom_fill_frame();
+    void note_playout(size_t samples);
 
     // Image transfer methods
     void handle_image_cmd();
@@ -377,6 +389,11 @@ private:
     uint32_t av_play_frames_ = 0;
     uint32_t av_play_clip_max_ = 0;
     uint32_t av_play_rms_max_ = 0;
+    // Both roles: call feedback killer on the AEC output. Microphone task
+    // only; the per-window maxima feed the periodic "intercom mic" line.
+    HowlSuppressor intercom_howl_{HowlSuppressor::kCallCapture};
+    uint32_t intercom_mic_clip_max_ = 0;
+    uint32_t intercom_mic_rms_max_ = 0;
 
     static RadioPing *instance_;
 
@@ -393,6 +410,10 @@ private:
     Mode mode_ = Mode::idle;
     volatile bool ptt_active_ = false;
     volatile bool suspended_ = false;
+    // tx_task only: when the current run of failed microphone reads began
+    // (0 = none), and rebuilds tried since one last succeeded.
+    int64_t mic_read_fail_since_us_ = 0;
+    uint32_t mic_rebuild_attempts_ = 0;
     bool tx_burst_active_ = false;
     bool tx_flush_pending_ = false;
     volatile bool irq_pending_ = false;
@@ -426,6 +447,15 @@ private:
     bool have_expected_play_seq_ = false;
     bool playback_pa_on_ = false;
     bool playback_active_ = false;
+    // Play task only. playout_end_us_ estimates when the speaker ring runs out
+    // of written audio: each frame is appended at the rate the I2S plays it,
+    // from "now" when the ring was already empty. The estimate is never later
+    // than the truth (a first write lands after the descriptor in flight), so
+    // the keeper errs towards filling early. playout_primed_: a call frame has
+    // reached the ring and the keeper is in charge until hang-up.
+    int64_t playout_end_us_ = 0;
+    bool playout_primed_ = false;
+    uint32_t intercom_fill_run_ = 0;    // fillers since the last real frame
     volatile bool intercom_active_ = false;
     volatile bool intercom_start_confirmed_ = false;
     volatile bool intercom_stop_confirmed_ = false;

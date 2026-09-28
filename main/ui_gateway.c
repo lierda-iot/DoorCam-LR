@@ -238,9 +238,10 @@ static uint16_t s_stats_total_retransmitted = 0;
 static bool s_stats_first_eot_seen = false;
 
 /* PAGE_CONFIG objects, indexed by control id: 0 capture, 3 volume, 5 PIR,
- * 7 low power; retired ids stay unused. cfg_create_toggle_row writes both
- * arrays, so both must cover the whole id space. */
-#define CFG_CTRL_COUNT  8
+ * 7 low power, 8 JPEG quality; retired ids stay unused. cfg_create_toggle_row
+ * writes both arrays, so both must cover the whole id space. */
+#define CFG_CTRL_COUNT  9
+#define CFG_CTRL_JPEG_QUALITY  8
 static lv_obj_t *s_cfg_touch_btns[CFG_CTRL_COUNT] = {NULL};
 static lv_obj_t *s_cfg_touch_lbls[CFG_CTRL_COUNT] = {NULL};
 /* Volume 0..15 in steps of 8 on the DAC scale, so 15 is the codec maximum.
@@ -254,6 +255,11 @@ static ui_gw_pir_trigger_cb_t s_pir_trigger_cb = NULL;
 static bool s_pir_on = false;
 static ui_gw_low_power_cb_t s_low_power_cb = NULL;
 static bool s_low_power_on = false;
+/* The node's JPEG quality as last accepted by it; the badge cycles MIN..MAX
+ * in STEPs and wraps. The node owns the setting (its NVS); this copy only
+ * drives the badge and is seeded from gateway NVS. */
+static ui_gw_jpeg_quality_cb_t s_jpeg_quality_cb = NULL;
+static uint8_t s_jpeg_quality = APP_IMAGE_JPEG_QUALITY;
 static ui_gw_intercom_cb_t s_intercom_cb = NULL;
 /* Display cache refreshed by ui_gw_set_intercom_active(). May be stale (the
  * node can end a call on its own); both stale readings are harmless because
@@ -1161,6 +1167,22 @@ static void cfg_btn_clicked_cb(lv_event_t *e)
         }
         gw_nvs_save_u8("vol", (uint8_t)s_volume_level);
         break;
+    case CFG_CTRL_JPEG_QUALITY: { /* next step, wrapping to MIN */
+        unsigned next = (unsigned)s_jpeg_quality + APP_IMAGE_JPEG_QUALITY_STEP;
+        if (next > APP_IMAGE_JPEG_QUALITY_MAX) next = APP_IMAGE_JPEG_QUALITY_MIN;
+        /* Like the switches: the badge only moves once the node has ACKed.
+         * A failed send leaves it where it was, which is the feedback. */
+        if (s_jpeg_quality_cb && s_jpeg_quality_cb((uint32_t)next)) {
+            s_jpeg_quality = (uint8_t)next;
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%u", (unsigned)s_jpeg_quality);
+            cfg_style_value(CFG_CTRL_JPEG_QUALITY, buf);
+            gw_nvs_save_u8("jpegq", s_jpeg_quality);
+        } else {
+            ESP_LOGW(TAG, "JPEG quality %u not accepted by the node", next);
+        }
+        break;
+    }
     }
 }
 
@@ -1389,6 +1411,17 @@ static void create_config_page(void)
     cfg_create_row(sec_audio, "Volume", NULL, 3, NULL);
     cfg_style_value(3, vol_buf);
 
+    /* ── IMAGE section: the node's encoder, sent as CONFIG ── */
+    lv_obj_t *sec_img = cfg_create_section(cont, "IMAGE");
+
+    char q_buf[8];
+    char q_desc[32];
+    snprintf(q_buf, sizeof(q_buf), "%u", (unsigned)s_jpeg_quality);
+    snprintf(q_desc, sizeof(q_desc), "Door camera, %d-%d",
+             APP_IMAGE_JPEG_QUALITY_MIN, APP_IMAGE_JPEG_QUALITY_MAX);
+    cfg_create_row(sec_img, "JPEG Quality", q_desc, CFG_CTRL_JPEG_QUALITY, NULL);
+    cfg_style_value(CFG_CTRL_JPEG_QUALITY, q_buf);
+
     /* ── SYSTEM section ── */
     lv_obj_t *sec_sys = cfg_create_section(cont, "SYSTEM");
 
@@ -1616,12 +1649,15 @@ esp_err_t ui_gw_init(void)
     if (s_volume_level > VOLUME_LEVEL_MAX) s_volume_level = VOLUME_LEVEL_MAX;
     s_pir_on = gw_nvs_load_u8("pir", 0) != 0;
     s_low_power_on = gw_nvs_load_u8("lowpwr", 0) != 0;
+    s_jpeg_quality = gw_nvs_load_u8("jpegq", APP_IMAGE_JPEG_QUALITY);
+    if (s_jpeg_quality < APP_IMAGE_JPEG_QUALITY_MIN) s_jpeg_quality = APP_IMAGE_JPEG_QUALITY_MIN;
+    if (s_jpeg_quality > APP_IMAGE_JPEG_QUALITY_MAX) s_jpeg_quality = APP_IMAGE_JPEG_QUALITY_MAX;
     /* Calls start only from the capture key and are never restored from NVS. */
     s_intercom_active = false;
     s_intercom_ui_state = INTERCOM_UI_IDLE;
     bsp_audio_set_volume((uint8_t)(s_volume_level * VOLUME_LEVEL_STEP));
-    ESP_LOGI(TAG, "NVS load: vol=%d pir=%d lowpwr=%d",
-             s_volume_level, s_pir_on, s_low_power_on);
+    ESP_LOGI(TAG, "NVS load: vol=%d pir=%d lowpwr=%d jpegq=%u",
+             s_volume_level, s_pir_on, s_low_power_on, (unsigned)s_jpeg_quality);
 
     xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
     create_shared_layout();
@@ -1665,6 +1701,11 @@ void ui_gw_set_pir_trigger_cb(ui_gw_pir_trigger_cb_t cb)
 void ui_gw_set_low_power_cb(ui_gw_low_power_cb_t cb)
 {
     s_low_power_cb = cb;
+}
+
+void ui_gw_set_jpeg_quality_cb(ui_gw_jpeg_quality_cb_t cb)
+{
+    s_jpeg_quality_cb = cb;
 }
 
 void ui_gw_set_intercom_cb(ui_gw_intercom_cb_t cb)

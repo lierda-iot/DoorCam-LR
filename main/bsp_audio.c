@@ -18,11 +18,19 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "driver/i2s_std.h"
 
 static const char *TAG = "bsp_audio";
+
+/* Upper bound on one blocking read/write. A running channel hands over a DMA
+ * buffer every 15 ms, so this is only ever hit on a channel that was disabled
+ * under the caller, where the driver would otherwise block for good. */
+#define BSP_AUDIO_IO_TIMEOUT_MS     100U
+/* How long a rebuild waits for such a caller to come back out. */
+#define BSP_AUDIO_IO_DRAIN_MS       (3U * BSP_AUDIO_IO_TIMEOUT_MS)
 
 /* ---- ES8311 register set we actually touch ----------------------------- */
 #define ES8311_RESET_REG00          0x00
@@ -63,7 +71,13 @@ static const char *TAG = "bsp_audio";
 static i2c_master_dev_handle_t s_codec;
 static i2s_chan_handle_t       s_tx, s_rx;
 static bool                    s_audio_ready;
-static bool                    s_i2s_enabled;
+static volatile bool           s_i2s_enabled;
+/* Callers currently inside i2s_channel_read/write. i2s_deinit() must not
+ * delete a channel one of them is blocked on: the IDF deletes the semaphore
+ * under the blocked task and it never runs again. */
+static volatile int            s_io_users;
+/* Serialises suspend/resume/depth changes, which come from different tasks. */
+static SemaphoreHandle_t       s_reconfig_lock;
 static uint32_t                s_sample_rate_hz;
 static uint32_t                s_dma_desc_num = 24U;
 /* Frames per DMA descriptor, taken from the channel config so the ring depth
@@ -294,11 +308,23 @@ static esp_err_t i2s_init_tx_only(uint32_t sample_rate_hz)
     return ESP_OK;
 }
 
+/* Tear the channels down in an order a concurrent reader/writer survives:
+ *  1. clear s_i2s_enabled, so a new bsp_audio_read/write returns at once;
+ *  2. disable, which wakes a caller blocked inside the driver (it returns
+ *     short);
+ *  3. wait for any caller that passed the flag just before step 1 - it is
+ *     blocked on the disabled channel's semaphore and comes back when its
+ *     bounded timeout expires;
+ *  4. only then delete the handles.
+ * Deleting first stranded the voice task forever, which showed up as a door
+ * station whose microphone went dead at the second call. */
 static esp_err_t i2s_deinit(void)
 {
     esp_err_t ret = ESP_OK;
+    const bool was_enabled = s_i2s_enabled;
 
-    if (s_i2s_enabled) {
+    s_i2s_enabled = false;
+    if (was_enabled) {
         esp_err_t err_rx = (s_rx != NULL) ? i2s_channel_disable(s_rx) : ESP_OK;
         esp_err_t err_tx = (s_tx != NULL) ? i2s_channel_disable(s_tx) : ESP_OK;
         if (err_rx != ESP_OK) {
@@ -309,7 +335,17 @@ static esp_err_t i2s_deinit(void)
             ESP_LOGW(TAG, "I2S TX disable failed: %s", esp_err_to_name(err_tx));
             if (ret == ESP_OK) ret = err_tx;
         }
-        s_i2s_enabled = false;
+    }
+
+    for (uint32_t waited = 0; s_io_users != 0 && waited < BSP_AUDIO_IO_DRAIN_MS;
+         waited += 10U) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_io_users != 0) {
+        /* Should not happen with the bounded I/O timeout; say so rather than
+         * delete under a caller. */
+        ESP_LOGE(TAG, "I2S teardown with %d caller(s) still inside the driver",
+                 s_io_users);
     }
 
     if (s_rx != NULL) {
@@ -340,6 +376,10 @@ static esp_err_t bsp_audio_init_duplex(uint32_t sample_rate_hz,
 {
     if (s_audio_ready) return ESP_OK;
 
+    if (s_reconfig_lock == NULL) {
+        s_reconfig_lock = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(s_reconfig_lock != NULL, ESP_ERR_NO_MEM, TAG, "reconfig lock");
+    }
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
     s_sample_rate_hz = sample_rate_hz;
 
@@ -396,6 +436,10 @@ esp_err_t bsp_audio_init_playback_only(uint32_t sample_rate_hz)
 {
     if (s_audio_ready) return ESP_OK;
 
+    if (s_reconfig_lock == NULL) {
+        s_reconfig_lock = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(s_reconfig_lock != NULL, ESP_ERR_NO_MEM, TAG, "reconfig lock");
+    }
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
     s_sample_rate_hz = sample_rate_hz;
 
@@ -438,27 +482,84 @@ uint32_t bsp_audio_tx_ring_ms(void)
     return s_dma_desc_num * s_dma_frame_num * 1000U / s_sample_rate_hz;
 }
 
+static void reconfig_lock(void)
+{
+    if (s_reconfig_lock != NULL) xSemaphoreTake(s_reconfig_lock, portMAX_DELAY);
+}
+
+static void reconfig_unlock(void)
+{
+    if (s_reconfig_lock != NULL) xSemaphoreGive(s_reconfig_lock);
+}
+
+/* Build the duplex channels at the given depth from whatever is there now:
+ * running, half-built (the IDF keeps the first channel when the second one
+ * fails), or nothing. Caller holds the reconfig lock. */
+static esp_err_t i2s_rebuild_locked(uint32_t dma_desc_num)
+{
+    if (s_tx != NULL || s_rx != NULL) {
+        esp_err_t err = i2s_deinit();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "I2S teardown before rebuild failed: %s", esp_err_to_name(err));
+            return err;
+        }
+    }
+    esp_err_t err = i2s_init(s_sample_rate_hz, dma_desc_num);
+    if (err != ESP_OK) {
+        (void)i2s_deinit();
+    }
+    return err;
+}
+
 esp_err_t bsp_audio_suspend(void)
 {
-    if (!s_audio_ready || (s_tx == NULL && s_rx == NULL)) return ESP_OK;
+    if (!s_audio_ready) return ESP_OK;
 
-    (void)bsp_audio_pa_enable(false);
-    esp_err_t err = i2s_deinit();
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "I2S released for camera capture");
+    reconfig_lock();
+    esp_err_t err = ESP_OK;
+    if (s_tx != NULL || s_rx != NULL) {
+        (void)bsp_audio_pa_enable(false);
+        err = i2s_deinit();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "I2S released for camera capture");
+        }
     }
+    reconfig_unlock();
     return err;
 }
 
 esp_err_t bsp_audio_resume(void)
 {
-    if (!s_audio_ready || s_i2s_enabled) return ESP_OK;
-    if (s_tx != NULL || s_rx != NULL) return ESP_ERR_INVALID_STATE;
+    if (!s_audio_ready) return ESP_OK;
 
-    esp_err_t err = i2s_init(s_sample_rate_hz, s_dma_desc_num);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "I2S rebuilt after camera capture");
+    reconfig_lock();
+    esp_err_t err = ESP_OK;
+    if (!s_i2s_enabled) {
+        err = i2s_rebuild_locked(s_dma_desc_num);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "I2S rebuilt at depth %" PRIu32, s_dma_desc_num);
+        } else {
+            ESP_LOGE(TAG, "I2S rebuild at depth %" PRIu32 " failed: %s",
+                     s_dma_desc_num, esp_err_to_name(err));
+        }
     }
+    reconfig_unlock();
+    return err;
+}
+
+esp_err_t bsp_audio_rebuild(void)
+{
+    if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
+
+    reconfig_lock();
+    esp_err_t err = i2s_rebuild_locked(s_dma_desc_num);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "I2S force-rebuilt at depth %" PRIu32, s_dma_desc_num);
+    } else {
+        ESP_LOGE(TAG, "I2S force-rebuild at depth %" PRIu32 " failed: %s",
+                 s_dma_desc_num, esp_err_to_name(err));
+    }
+    reconfig_unlock();
     return err;
 }
 
@@ -466,7 +567,12 @@ esp_err_t bsp_audio_set_dma_desc_num(uint32_t dma_desc_num)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
     if (dma_desc_num == 0U) return ESP_ERR_INVALID_ARG;
-    if (dma_desc_num == s_dma_desc_num) return ESP_OK;
+
+    reconfig_lock();
+    if (dma_desc_num == s_dma_desc_num) {
+        reconfig_unlock();
+        return ESP_OK;
+    }
 
     /* I2S released (camera capture holds it): just record the new depth so the
      * next bsp_audio_resume() rebuilds at it, without touching hardware now. */
@@ -474,26 +580,29 @@ esp_err_t bsp_audio_set_dma_desc_num(uint32_t dma_desc_num)
         s_dma_desc_num = dma_desc_num;
         ESP_LOGI(TAG, "I2S DMA depth deferred to %" PRIu32 " (I2S released)",
                  dma_desc_num);
+        reconfig_unlock();
         return ESP_OK;
     }
 
-    /* i2s_deinit() disables the channels first, unblocking any parked voice
-     * task, and clears s_i2s_enabled before deleting the handles so a racing
-     * bsp_audio_read/write cannot touch a freed handle. */
-    esp_err_t err = i2s_deinit();
+    esp_err_t err = i2s_rebuild_locked(dma_desc_num);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "I2S deinit before depth change failed: %s",
-                 esp_err_to_name(err));
-        return err;
-    }
-    err = i2s_init(s_sample_rate_hz, dma_desc_num);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2S reinit at depth %" PRIu32 " failed: %s",
-                 dma_desc_num, esp_err_to_name(err));
+        /* Usually ESP_ERR_NO_MEM: the deep ring is ~92 KB of internal DMA RAM.
+         * Do not leave the channels torn down - nothing on the door station
+         * would ever rebuild them and the microphone would stay dead until a
+         * reboot. Go back to the depth that was just running. */
+        ESP_LOGE(TAG, "I2S reinit at depth %" PRIu32 " failed: %s, restoring depth %" PRIu32,
+                 dma_desc_num, esp_err_to_name(err), s_dma_desc_num);
+        esp_err_t back = i2s_rebuild_locked(s_dma_desc_num);
+        if (back != ESP_OK) {
+            ESP_LOGE(TAG, "I2S restore at depth %" PRIu32 " failed too: %s",
+                     s_dma_desc_num, esp_err_to_name(back));
+        }
+        reconfig_unlock();
         return err;
     }
     s_dma_desc_num = dma_desc_num;
     ESP_LOGI(TAG, "I2S DMA depth changed to %" PRIu32, dma_desc_num);
+    reconfig_unlock();
     return ESP_OK;
 }
 
@@ -523,16 +632,28 @@ esp_err_t bsp_audio_set_mic_gain_db(uint8_t gain_db)
     return es_write(ES8311_SYSTEM_REG14, 0x10 | bits);
 }
 
+/* The user count is raised before the enabled check so i2s_deinit() sees a
+ * caller that read the flag as true a moment before it was cleared. */
 esp_err_t bsp_audio_write(const void *buf, size_t bytes, size_t *out_written)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
-    if (!s_i2s_enabled) return ESP_ERR_INVALID_STATE;
-    return i2s_channel_write(s_tx, buf, bytes, out_written, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    __atomic_add_fetch(&s_io_users, 1, __ATOMIC_SEQ_CST);
+    if (s_i2s_enabled && s_tx != NULL) {
+        err = i2s_channel_write(s_tx, buf, bytes, out_written, BSP_AUDIO_IO_TIMEOUT_MS);
+    }
+    __atomic_sub_fetch(&s_io_users, 1, __ATOMIC_SEQ_CST);
+    return err;
 }
 
 esp_err_t bsp_audio_read(void *buf, size_t bytes, size_t *out_read)
 {
     if (!s_audio_ready) return ESP_ERR_INVALID_STATE;
-    if (!s_i2s_enabled || s_rx == NULL) return ESP_ERR_INVALID_STATE;
-    return i2s_channel_read(s_rx, buf, bytes, out_read, portMAX_DELAY);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    __atomic_add_fetch(&s_io_users, 1, __ATOMIC_SEQ_CST);
+    if (s_i2s_enabled && s_rx != NULL) {
+        err = i2s_channel_read(s_rx, buf, bytes, out_read, BSP_AUDIO_IO_TIMEOUT_MS);
+    }
+    __atomic_sub_fetch(&s_io_users, 1, __ATOMIC_SEQ_CST);
+    return err;
 }

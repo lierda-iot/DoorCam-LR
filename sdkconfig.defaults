@@ -8,10 +8,12 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
-# Preserve the checked-in debug optimization used by the current firmware.
-CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+# Use release-oriented performance optimization instead of debug optimization.
+# The real-time two-way voice path needs the CPU headroom, and the image is
+# far smaller than the app partition.
+# CONFIG_COMPILER_OPTIMIZATION_DEBUG is not set
 # CONFIG_COMPILER_OPTIMIZATION_SIZE is not set
-# CONFIG_COMPILER_OPTIMIZATION_PERF is not set
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # CONFIG_COMPILER_OPTIMIZATION_NONE is not set
 
 # LR2021 radio driver (esp_lora_driver)

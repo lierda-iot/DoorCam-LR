@@ -1,12 +1,12 @@
-# AM36 Electronic Doorbell
+# AM36-DoorCam
 
 Language: [中文](README.MD) | English
 
-AM36 Electronic Doorbell is an open-source two-device video-doorbell demonstration built on the Lierda AM36 ESP32-S3 and LR2021 platform. Both devices run the same firmware: one operates as the outdoor door station and the other as the indoor display gateway. The selected role is stored in NVS and remains active after a restart.
+AM36-DoorCam is an open-source two-device video-doorbell demonstration built on the Lierda AM36 ESP32-S3 and LR2021 platform. Both devices run the same firmware: one operates as the outdoor door station and the other as the indoor display gateway. The selected role is stored in NVS and remains active after a restart.
 
 The door station provides a one-way live video uplink and door-side audio to the display gateway. Answering keeps the door video on screen while opening full-duplex two-way voice. If a ring is not answered, the gateway can retain up to two missed audio/video records in PSRAM. An optional PIR sensor on the door station can also push up to five motion snapshots.
 
-![AM36 Electronic Doorbell workflow](docs/images/doorbell-workflow.png)
+![AM36-DoorCam door station and display gateway](docs/images/am36-doorbell-hardware-v2.jpg)
 
 ## Table of Contents
 
@@ -39,6 +39,8 @@ The door station provides a one-way live video uplink and door-side audio to the
 - On-screen gateway/node voltage, throughput, frame rate, RSSI, event age, microphone state, and unseen-visitor count.
 
 Missed records and PIR snapshots exist only in gateway PSRAM and are lost after a restart or power loss. The current firmware does not provide an HTTP gallery or persistent visitor storage.
+
+![AM36-DoorCam workflow](docs/images/doorbell-workflow.png)
 
 ## Hardware Platform and Roles
 
@@ -78,8 +80,8 @@ The firmware arms `GPIO12` about 5 seconds after startup. A high output from the
 
 ## Documentation and Hardware Files
 
-- [English Feature Guide](docs/guides/AM36_Electronic_Doorbell_Feature_Guide.pdf)
-- [Chinese Feature Guide](docs/guides/AM36_Electronic_Doorbell_Feature_Guide_ZH.pdf)
+- [English Feature Guide](docs/guides/AM36_DoorCam_Feature_Guide.pdf)
+- [Chinese Feature Guide](docs/guides/AM36_DoorCam_Feature_Guide_ZH.pdf)
 - [DK01 development-kit schematic](docs/hardware/schematic/L-LRMAM36-FANN4-DK01_SCH.pdf)
 - [DK01 development-kit PCB source](docs/hardware/pcb/L-LRMAM36-FANN4-DK01_PCB.PcbDoc)
 - [Seven STEP enclosure and structural files](docs/3d-print/README.md)
@@ -149,16 +151,17 @@ The status bar reports gateway and door-station voltage, live KB/s, displayed FP
 
 ## Settings
 
-The current `Settings` page contains four controls:
+The current `Settings` page contains five controls:
 
 | Control | Action |
 | --- | --- |
 | `CAPTURE` | Same state machine as gateway `K5`: start view/listen, then enter or leave two-way voice. |
 | `PIR Motion` | Enable or disable door-station PIR snapshots. |
 | `Volume` | Cycle gateway playback volume from 0 through 15, about 8.5 dB per step; 15 is the maximum. |
+| `JPEG Quality` | Cycle the door-station encoder quality from 15 through 95 in steps of 10; default 25. Higher values give a sharper picture and larger frames. |
 | `Low Power` | Enable or disable door-station LoRa CAD standby. |
 
-PIR and low-power state are updated only after a successful configuration exchange with the door station and are stored in device NVS. Volume is stored in gateway NVS.
+PIR, low-power, and JPEG-quality state are updated only after a successful configuration exchange with the door station and are stored in door-station NVS; the gateway keeps a copy for display. Volume is stored in gateway NVS.
 
 ## Low-Power Mode
 
@@ -248,6 +251,6 @@ Press `Ctrl+]` to leave the monitor, then flash the same firmware image to the s
 
 ## License and Versioning
 
-AM36 Electronic Doorbell is distributed under the [BSD-3-Clause license](LICENSE), with Lierda Science&Technology Group Co.,Ltd as the copyright holder.
+AM36-DoorCam is distributed under the [BSD-3-Clause license](LICENSE), with Lierda Science&Technology Group Co.,Ltd as the copyright holder.
 
 Third-party source, components, and hardware materials retain their applicable terms and attribution; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The firmware version comes from [version.txt](version.txt) and is recorded in [CHANGELOG.md](CHANGELOG.md). Release tags use the `vMAJOR.MINOR.PATCH` format.

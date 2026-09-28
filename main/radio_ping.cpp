@@ -578,6 +578,9 @@ void RadioPing::start_intercom_local(uint16_t session)
     intercom_aec_us_total_ = 0;
     intercom_aec_us_max_ = 0;
     intercom_input_clip_samples_ = 0;
+    intercom_howl_.reset();
+    intercom_mic_clip_max_ = 0;
+    intercom_mic_rms_max_ = 0;
     intercom_next_slot_us_ = esp_timer_get_time() + 20000;
     ptt_active_ = false;
     tx_burst_active_ = false;
@@ -639,6 +642,12 @@ void RadioPing::stop_intercom_local()
     log_intercom_image_stats(true);
     intercom_last_stopped_session_ = intercom_session_;
     intercom_active_ = false;
+    // Its own mutex serialises this against a process_capture() in flight.
+    // Before the state callback: on the node that callback rebuilds the I2S
+    // ring at the deep depth (~92 KB of internal DMA RAM), which must not
+    // compete with the AEC's internal buffers; a failed rebuild left the
+    // microphone dead until the node was rebooted.
+    echo_canceller_.deinit();
     if (intercom_state_cb_) intercom_state_cb_(false);
     intercom_reply_pending_ = false;
     intercom_stop_requested_ = false;
@@ -647,8 +656,6 @@ void RadioPing::stop_intercom_local()
     if (voice_queue_) xQueueReset(voice_queue_);
     set_playback_pa(false);
     playback_active_ = false;
-    // Its own mutex serialises this against a process_capture() in flight.
-    echo_canceller_.deinit();
     // Clear in-call image state before the next ordinary image transfer.
     if (intercom_img_buf_) {
         heap_caps_free(intercom_img_buf_);
@@ -972,9 +979,11 @@ void RadioPing::tx_task()
         }
 
         if (!read_mono_frame(tx_pcm_, APP_AUDIO_FRAME_SAMPLES)) {
+            note_mic_read_failure();
             vTaskDelay(ms_to_ticks_min_1(APP_AUDIO_FRAME_MS));
             continue;
         }
+        mic_read_fail_since_us_ = 0;
 
         if (intercom_active_) {
             uint32_t aec_us = 0;
@@ -1008,6 +1017,37 @@ void RadioPing::tx_task()
                 }
                 tx_pcm_[i] = static_cast<int16_t>(scaled);
             }
+#if APP_INTERCOM_HOWL_ENABLE
+            // Feedback killer on the AEC output. Both boxes run it, so a howl
+            // opens the loop at whichever end sees it first; the far end then
+            // stops hearing it one round trip later and unmutes on its own.
+            // See APP_INTERCOM_HOWL_ENABLE.
+            {
+                const bool was_muted = intercom_howl_.muted();
+                const bool mute = intercom_howl_.process(tx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+                const HowlSuppressor::Features &f = intercom_howl_.last();
+                if (f.clip_percent > intercom_mic_clip_max_) intercom_mic_clip_max_ = f.clip_percent;
+                if (f.rms > intercom_mic_rms_max_) intercom_mic_rms_max_ = f.rms;
+                if (mute) {
+                    std::memset(tx_pcm_, 0, sizeof(tx_pcm_));
+                    if (!was_muted) {
+                        ESP_LOGW(TAG, "call howl: muting microphone clip=%lu%% rms=%lu events=%lu",
+                                 static_cast<unsigned long>(f.clip_percent),
+                                 static_cast<unsigned long>(f.rms),
+                                 static_cast<unsigned long>(intercom_howl_.mute_events()));
+#if APP_INTERCOM_AEC_ENABLE
+                        // Whatever got through was more than the steady NLP
+                        // could hold; give the filter a warm-up window again.
+                        echo_canceller_.rearm_nlp();
+#endif
+                    }
+                } else if (was_muted) {
+                    ESP_LOGI(TAG, "call howl: microphone restored after %lu frames%s",
+                             static_cast<unsigned long>(intercom_howl_.muted_frames()),
+                             intercom_howl_.hit_cap() ? " (cap)" : "");
+                }
+            }
+#endif
             intercom_mic_frames_++;
             intercom_aec_us_total_ += aec_us;
             if (aec_us > intercom_aec_us_max_) intercom_aec_us_max_ = aec_us;
@@ -1016,6 +1056,8 @@ void RadioPing::tx_task()
                 // ref_lag: reference-to-echo delay. The filter is causal, so a
                 // reference that lags the echo cancels nothing. Healthy is a
                 // 0..50 ms sawtooth (one FLRC packet carries 5 x 10 ms frames).
+                // clip_max/rms_max: window maxima of the AEC output, the same
+                // features the howl killer trips on (a howl shows here first).
                 EchoCanceller::ReferenceStats ref;
 #if APP_INTERCOM_AEC_ENABLE
                 ref = echo_canceller_.reference_stats(true);
@@ -1025,7 +1067,8 @@ void RadioPing::tx_task()
                          "aec_avg_abs=%lu aec_peak=%ld "
                          "clip_total=%lu aec_avg=%luus aec_max=%luus "
                          "ref_lag=%lums ref_peak=%lums ref_trim=%lu "
-                         "ref_under=%lu ref_over=%lu",
+                         "ref_under=%lu ref_over=%lu "
+                         "clip_max=%lu%% rms_max=%lu howl_events=%lu howl_muted=%d",
                          static_cast<unsigned long>(intercom_mic_frames_),
                          static_cast<unsigned long>(
                              raw_sum_abs / APP_AUDIO_FRAME_SAMPLES),
@@ -1042,7 +1085,13 @@ void RadioPing::tx_task()
                              ref.peak * 1000U / APP_AUDIO_SAMPLE_RATE_HZ),
                          static_cast<unsigned long>(ref.trims),
                          static_cast<unsigned long>(ref.underflows),
-                         static_cast<unsigned long>(ref.overflows));
+                         static_cast<unsigned long>(ref.overflows),
+                         static_cast<unsigned long>(intercom_mic_clip_max_),
+                         static_cast<unsigned long>(intercom_mic_rms_max_),
+                         static_cast<unsigned long>(intercom_howl_.mute_events()),
+                         intercom_howl_.muted() ? 1 : 0);
+                intercom_mic_clip_max_ = 0;
+                intercom_mic_rms_max_ = 0;
             }
             uint8_t encoded[APP_OPUS_MAX_PACKET_BYTES];
             codec_lock();
@@ -1095,7 +1144,13 @@ void RadioPing::play_task()
     VoicePacket packet;
 
     while (true) {
-        if (xQueueReceive(voice_queue_, &packet, portMAX_DELAY) != pdTRUE) {
+        // In a call, wait only until the ring is down to the guard; if nothing
+        // arrived by then, top it up instead (APP_INTERCOM_PLAYOUT_GUARD_MS).
+        const TickType_t wait = intercom_fill_wait();
+        if (xQueueReceive(voice_queue_, &packet, wait) != pdTRUE) {
+            if (wait != portMAX_DELAY && intercom_fill_due()) {
+                intercom_fill_frame();
+            }
             continue;
         }
 
@@ -1153,6 +1208,7 @@ void RadioPing::play_task()
             }
         }
         const bool written = play_mono_frame(rx_pcm_, static_cast<size_t>(decoded));
+        intercom_fill_run_ = 0;
 #if APP_INTERCOM_AEC_ENABLE
         // Reference after the write, and only if it landed in the DMA ring:
         // every frame must enter both the reference FIFO and the TX ring or
@@ -2616,8 +2672,7 @@ void RadioPing::av_playback_process(int16_t *pcm, size_t samples, bool synthetic
         } else if (!mute && was_muted) {
             ESP_LOGI(TAG, "A/V howl: playback restored after %lu frames%s",
                      static_cast<unsigned long>(av_howl_.muted_frames()),
-                     av_howl_.muted_frames() >= APP_AV_HOWL_MAX_MUTE_FRAMES
-                         ? " (cap)" : "");
+                     av_howl_.hit_cap() ? " (cap)" : "");
         }
 
         // Window maxima, not a per-second sample: a single 10 ms snapshot
@@ -2671,6 +2726,11 @@ void RadioPing::log_rx(uint16_t seq, uint16_t len, int16_t rssi)
 void RadioPing::wait_for_jitter_buffer()
 {
     if (playback_active_ || voice_queue_ == nullptr || APP_RX_JITTER_FRAMES <= 1U) {
+        return;
+    }
+    // A call that has been playing kept its ring topped up through the gap,
+    // so the cushion is already there; blocking here would let it run dry.
+    if (intercom_active_ && playout_primed_) {
         return;
     }
 
@@ -2738,10 +2798,8 @@ bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
         esp_err_t err = bsp_audio_read(reinterpret_cast<uint8_t *>(stereo) + got_total,
                                        target - got_total, &got);
         if (err != ESP_OK || got == 0) {
-            if (!image_tx_active_) {
-                //ESP_LOGW(TAG, "audio read failed: %s got=%u",
-                         //esp_err_to_name(err), static_cast<unsigned>(got));
-            }
+            // Silent on purpose: a depth change or camera release fails a read
+            // or two every time. note_mic_read_failure() reports a run.
             return false;
         }
         got_total += got;
@@ -2753,9 +2811,41 @@ bool RadioPing::read_mono_frame(int16_t *mono, size_t samples)
     return true;
 }
 
+void RadioPing::note_mic_read_failure()
+{
+    // 1 s of unbroken failures. A depth change or a camera release costs a
+    // few reads; the I2S staying down (a rebuild that failed, see
+    // bsp_audio_set_dma_desc_num) or an RX DMA that stopped delivering costs
+    // all of them, and on the door station nothing else would ever bring it
+    // back: the stream carries video and no sound until the next reboot.
+    const int64_t now_us = esp_timer_get_time();
+    if (mic_read_fail_since_us_ == 0) {
+        mic_read_fail_since_us_ = now_us;
+        return;
+    }
+    if (now_us - mic_read_fail_since_us_ < 1000000LL) return;
+    mic_read_fail_since_us_ = 0;
+
+    // Suspended means the camera holds the I2S's DMA memory on purpose; its
+    // owner brings the I2S back.
+    if (suspended_) return;
+
+    mic_rebuild_attempts_++;
+    const esp_err_t err = bsp_audio_rebuild();
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "microphone reads failed for 1 s, I2S rebuilt (attempt %lu)",
+                 static_cast<unsigned long>(mic_rebuild_attempts_));
+        mic_rebuild_attempts_ = 0;
+    } else if (mic_rebuild_attempts_ == 1U || (mic_rebuild_attempts_ % 30U) == 0U) {
+        ESP_LOGE(TAG, "microphone reads failing, I2S rebuild failed: %s (attempt %lu)",
+                 esp_err_to_name(err),
+                 static_cast<unsigned long>(mic_rebuild_attempts_));
+    }
+}
+
 // True only when the whole frame reached the DMA ring; a short write means the
 // I2S channel was disabled underneath us, not a full ring.
-bool RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
+bool RadioPing::play_mono_frame(const int16_t *mono, size_t samples, bool pa_on)
 {
     int16_t stereo[APP_AUDIO_FRAME_SAMPLES * 2];
     if (samples > APP_AUDIO_FRAME_SAMPLES) {
@@ -2767,7 +2857,9 @@ bool RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
         stereo[2 * i + 1] = mono[i];
     }
 
-    set_playback_pa(true);
+    if (pa_on) {
+        set_playback_pa(true);
+    }
     const size_t bytes = samples * 2 * sizeof(int16_t);
     size_t written = 0;
     esp_err_t err = bsp_audio_write(stereo, bytes, &written);
@@ -2775,9 +2867,87 @@ bool RadioPing::play_mono_frame(const int16_t *mono, size_t samples)
         ESP_LOGW(TAG, "audio write failed: %s written=%u/%u",
                  esp_err_to_name(err), static_cast<unsigned>(written),
                  static_cast<unsigned>(bytes));
+        // Whatever the ring holds now is unknown; stop keeping it.
+        playout_primed_ = false;
         return false;
     }
+    note_playout(samples);
     return true;
+}
+
+void RadioPing::note_playout(size_t samples)
+{
+    const int64_t now = esp_timer_get_time();
+    const int64_t start = playout_end_us_ > now ? playout_end_us_ : now;
+    playout_end_us_ = start + static_cast<int64_t>(samples) * 1000000 /
+                                  static_cast<int64_t>(APP_AUDIO_SAMPLE_RATE_HZ);
+    // The ring cannot hold more than its depth, whatever the sum says.
+    const int64_t full_us = now + static_cast<int64_t>(bsp_audio_tx_ring_ms()) * 1000;
+    if (playout_end_us_ > full_us) {
+        playout_end_us_ = full_us;
+    }
+    if (intercom_active_ && !suspended_) {
+        playout_primed_ = true;
+    }
+}
+
+TickType_t RadioPing::intercom_fill_wait()
+{
+    if (!intercom_active_ || suspended_) {
+        playout_primed_ = false;
+    }
+    if (!playout_primed_) return portMAX_DELAY;
+    const int64_t slack_us = playout_end_us_ - esp_timer_get_time() -
+        static_cast<int64_t>(APP_INTERCOM_PLAYOUT_GUARD_MS) * 1000;
+    if (slack_us <= 0) return 0;
+    // Round up: waking early would only come back round to wait again.
+    return ms_to_ticks_min_1(static_cast<uint32_t>((slack_us + 999) / 1000));
+}
+
+bool RadioPing::intercom_fill_due() const
+{
+    return playout_primed_ && intercom_active_ && !suspended_ &&
+           playout_end_us_ - esp_timer_get_time() <
+               static_cast<int64_t>(APP_INTERCOM_PLAYOUT_GUARD_MS) * 1000;
+}
+
+// The frame that was due has not arrived and the ring is down to the guard.
+// Write concealment for the first few (what conceal_missing_frames() would
+// have written anyway, only in time), then silence, and give each filler to
+// the AEC reference like any other frame: the ring and the reference then
+// never lose step, whatever the radio does.
+void RadioPing::intercom_fill_frame()
+{
+    size_t samples = APP_AUDIO_FRAME_SAMPLES;
+    bool concealed = false;
+    if (intercom_fill_run_ < APP_RX_MAX_PLC_FRAMES) {
+        codec_lock();
+        const int decoded = codec_.decode_lost(rx_pcm_, APP_AUDIO_FRAME_SAMPLES);
+        codec_unlock();
+        if (decoded > 0) {
+            samples = static_cast<size_t>(decoded);
+            apply_intercom_playback_gain(rx_pcm_, samples);
+            concealed = true;
+        }
+    }
+    if (!concealed) {
+        std::memset(rx_pcm_, 0, sizeof(rx_pcm_));
+    }
+    intercom_fill_run_++;
+
+    // The PA is already on (a call frame primed the keeper); a filler racing
+    // hang-up must not switch it back on.
+    const bool written = play_mono_frame(rx_pcm_, samples, false);
+    if (!written) return;
+#if APP_INTERCOM_AEC_ENABLE
+    echo_canceller_.push_reference(rx_pcm_, samples);
+#endif
+    // The filler took the next frame's place. If that frame turns up late it
+    // reads as behind the timeline, and conceal_missing_frames() plays it and
+    // resyncs, one frame of extra cushion; if it was lost the gap is smaller.
+    if (have_expected_play_seq_) {
+        expected_play_seq_ = static_cast<uint16_t>(expected_play_seq_ + 1);
+    }
 }
 
 void RadioPing::set_playback_pa(bool on)
@@ -2798,7 +2968,14 @@ void RadioPing::update_playback_timeout()
     if (!playback_active_) return;
     uint32_t now = smtc_modem_hal_get_time_in_ms();
     if (now - last_rx_audio_ms_ > APP_RX_AUDIO_TIMEOUT_MS) {
-        set_playback_pa(false);
+        // A call rides through a dropout with the PA on: the play task keeps
+        // the ring fed (intercom_fill_frame), while the PA's mute/unmute is
+        // a thump on the speaker that the AEC never sees as reference. In the
+        // soak logs both howls started within seconds of that toggle after a
+        // 200 ms radio gap. The PA goes off at hang-up in stop_intercom_local().
+        if (!intercom_active_) {
+            set_playback_pa(false);
+        }
         playback_active_ = false;
         have_expected_play_seq_ = false;
     }

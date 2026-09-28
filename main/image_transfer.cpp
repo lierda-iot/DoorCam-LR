@@ -25,6 +25,13 @@ uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
 }
 }
 
+void ImageTransfer::set_jpeg_quality(uint8_t quality)
+{
+    if (quality < APP_IMAGE_JPEG_QUALITY_MIN) quality = APP_IMAGE_JPEG_QUALITY_MIN;
+    if (quality > APP_IMAGE_JPEG_QUALITY_MAX) quality = APP_IMAGE_JPEG_QUALITY_MAX;
+    jpeg_quality_ = quality;
+}
+
 esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
                                       uint32_t width, uint32_t height, uint32_t pixfmt,
                                       uint8_t **out_jpeg, size_t *out_jpeg_len)
@@ -86,7 +93,8 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
     enc_cfg.height = static_cast<int>(height);
     enc_cfg.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
     enc_cfg.subsampling = JPEG_SUBSAMPLE_420;
-    enc_cfg.quality = APP_IMAGE_JPEG_QUALITY;
+    const uint8_t quality = jpeg_quality_;
+    enc_cfg.quality = quality;
     enc_cfg.task_enable = false;
 
     jpeg_enc_handle_t encoder = nullptr;
@@ -139,9 +147,9 @@ esp_err_t ImageTransfer::encode_frame(const uint8_t *yuv422, size_t yuv_len,
              (long long)(t_cleanup_done - t_encode_start));
 
     // Per-frame encode on the capture hot path — DEBUG to keep the stream quiet.
-    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
+    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%u)",
              static_cast<unsigned long>(width), static_cast<unsigned long>(height),
-             out_size, APP_IMAGE_JPEG_QUALITY);
+             out_size, quality);
 
     *out_jpeg = jpeg_buf;
     *out_jpeg_len = static_cast<size_t>(out_size);
@@ -185,7 +193,8 @@ esp_err_t ImageTransfer::encode_prepared_frame(const uint8_t *input, size_t inpu
     enc_cfg.height = static_cast<int>(height);
     enc_cfg.src_type = gray ? JPEG_PIXEL_FORMAT_GRAY : JPEG_PIXEL_FORMAT_YCbYCr;
     enc_cfg.subsampling = gray ? JPEG_SUBSAMPLE_GRAY : JPEG_SUBSAMPLE_420;
-    enc_cfg.quality = APP_IMAGE_JPEG_QUALITY;
+    const uint8_t quality = jpeg_quality_;
+    enc_cfg.quality = quality;
     enc_cfg.task_enable = false;
 
     jpeg_enc_handle_t encoder = nullptr;
@@ -231,10 +240,10 @@ esp_err_t ImageTransfer::encode_prepared_frame(const uint8_t *input, size_t inpu
              (long long)(t_jpeg_done - t_jpeg_start),
              (long long)(t_cleanup_done - t_cleanup_start),
              (long long)(t_cleanup_done - t_encode_start));
-    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%d)",
+    ESP_LOGD(TAG, "JPEG encoded: %lux%lu → %d bytes (Q=%u)",
              static_cast<unsigned long>(width),
              static_cast<unsigned long>(height),
-             out_size, APP_IMAGE_JPEG_QUALITY);
+             out_size, quality);
 
     *out_jpeg = jpeg_buf;
     *out_jpeg_len = static_cast<size_t>(out_size);

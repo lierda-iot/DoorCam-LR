@@ -916,7 +916,7 @@ static void lvgl_create_demo_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x101820), 0);
 
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "AM36 Electronic Doorbell");
+    lv_label_set_text(title, "AM36-DoorCam");
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 

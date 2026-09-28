@@ -1,12 +1,12 @@
-# AM36 Electronic Doorbell
+# AM36-DoorCam
 
 语言：中文 | [English](README_EN.md)
 
-AM36 Electronic Doorbell 是一套基于利尔达 AM36 ESP32-S3 与 LR2021 平台的开源双机视频门铃演示。两台设备使用同一份固件：一台作为室外门口机，另一台作为室内显示网关；所选角色保存在 NVS 中，重启后继续生效。
+AM36-DoorCam 是一套基于利尔达 AM36 ESP32-S3 与 LR2021 平台的开源双机视频门铃演示。两台设备使用同一份固件：一台作为室外门口机，另一台作为室内显示网关；所选角色保存在 NVS 中，重启后继续生效。
 
 门口机向显示网关提供单向实时视频上行和门口声音；接听后，系统在继续显示门口视频的同时建立双向全双工语音。门铃无人接听时，网关可在 PSRAM 中保存最多 2 条未接音视频记录；门口机的可选 PIR 传感器还可主动推送最多 5 张移动抓拍。
 
-![AM36 Electronic Doorbell 工作流程](docs/images/doorbell-workflow-zh.png)
+![AM36-DoorCam 门口机与显示网关正反面](docs/images/am36-doorbell-hardware-v2-zh.jpg)
 
 ## 目录
 
@@ -39,6 +39,8 @@ AM36 Electronic Doorbell 是一套基于利尔达 AM36 ESP32-S3 与 LR2021 平�
 - 网关显示两端电压、传输速率、帧率、RSSI、事件时间、麦克风状态和未读访客数。
 
 未接记录和 PIR 抓拍仅保存在网关 PSRAM 中，重启或断电后会丢失。当前固件不提供 HTTP 图库或持久化访客存储。
+
+![AM36-DoorCam 工作流程](docs/images/doorbell-workflow-zh.png)
 
 ## 硬件平台与设备角色
 
@@ -78,8 +80,8 @@ PIR 仅用于**门口机角色**。`GPIO12` 在显示网关角色中同时用于
 
 ## 说明文档与硬件资料
 
-- [中文功能说明](docs/guides/AM36_Electronic_Doorbell_Feature_Guide_ZH.pdf)
-- [英文功能说明](docs/guides/AM36_Electronic_Doorbell_Feature_Guide.pdf)
+- [中文功能说明](docs/guides/AM36_DoorCam_Feature_Guide_ZH.pdf)
+- [英文功能说明](docs/guides/AM36_DoorCam_Feature_Guide.pdf)
 - [DK01 开发套件原理图](docs/hardware/schematic/L-LRMAM36-FANN4-DK01_SCH.pdf)
 - [DK01 开发套件 PCB 源文件](docs/hardware/pcb/L-LRMAM36-FANN4-DK01_PCB.PcbDoc)
 - [7 个 STEP 外壳与结构件](docs/3d-print/README.md)
@@ -149,16 +151,17 @@ PIR 在门口机启动约 5 秒后布防。检测到 GPIO12 高电平后推送�
 
 ## 设置项
 
-当前 `Settings` 页面只有四项操作：
+当前 `Settings` 页面只有五项操作：
 
 | 设置项 | 功能 |
 | --- | --- |
 | `CAPTURE` | 与网关 `K5` 相同：启动查看/监听，并在后续操作中进入或退出双向通话。 |
 | `PIR Motion` | 开启或关闭门口机 PIR 抓拍。 |
 | `Volume` | 网关播放音量在 0 至 15 之间循环，每档约 8.5 dB，15 为最大。 |
+| `JPEG Quality` | 门口机图像编码质量，在 15 至 95 之间以 10 为步进循环，默认 25。数值越高画面越清晰，每帧也更大。 |
 | `Low Power` | 开启或关闭门口机 LoRa CAD 低功耗待机。 |
 
-PIR 和低功耗状态只有在与门口机的配置交互成功后才更新，并保存在设备 NVS 中。音量保存在网关 NVS 中。
+PIR、低功耗和 JPEG 质量只有在与门口机的配置交互成功后才更新，并保存在门口机 NVS 中；网关另存一份用于显示。音量保存在网关 NVS 中。
 
 ## 低功耗模式
 
@@ -248,6 +251,6 @@ idf.py -p COMx flash monitor
 
 ## 许可证与版本
 
-AM36 Electronic Doorbell 使用 [BSD-3-Clause 许可证](LICENSE)发布，版权主体为 Lierda Science&Technology Group Co.,Ltd。
+AM36-DoorCam 使用 [BSD-3-Clause 许可证](LICENSE)发布，版权主体为 Lierda Science&Technology Group Co.,Ltd。
 
 第三方源码、组件和硬件资料继续适用各自的许可与署名要求，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。固件版本由 [version.txt](version.txt) 提供，并记录在 [CHANGELOG.md](CHANGELOG.md) 中；发布标签使用 `vMAJOR.MINOR.PATCH` 格式。

@@ -128,12 +128,34 @@
 /* ESP-SR recommends filter length 4 for ESP32-S3 full-duplex AEC. */
 #define APP_AFE_AEC_FILTER_LENGTH       4U
 
-/* Use stronger residual-echo suppression while the adaptive filter converges,
- * then relax it for speech clarity. Levels: 0 normal, 1 aggressive, 2 very
- * aggressive. */
+/* Residual-echo suppression (NLP) level while the adaptive filter converges
+ * and afterwards. Levels: 0 normal, 1 aggressive (the ESP-SR default), 2 very
+ * aggressive. A call is a closed loop through two speaker-to-microphone
+ * couplings, so whatever residual both AECs leave circulates; relaxing to 0
+ * after the warm-up gave clearer double-talk but, in a quiet room with a far
+ * link, the residual grew into a periodic howl. 1 keeps the loop margin;
+ * APP_INTERCOM_HOWL_* is the backstop if it still closes. */
 #define APP_AFE_AEC_NLP_LEVEL_STARTUP   1
-#define APP_AFE_AEC_NLP_LEVEL_STEADY    0
+#define APP_AFE_AEC_NLP_LEVEL_STEADY    1
 #define APP_AFE_AEC_NLP_WARMUP_MS       3000U
+
+/* Call feedback killer, on the microphone path after the AEC of both boxes.
+ * Nothing in a quiet room masks the residual echo, and once the loop gain
+ * passes unity it grows into a howl within a few round trips. While the AEC
+ * output looks like a howl the frames go out as silence, which opens the loop
+ * at this box, and the NLP goes back to the startup level. Same features and
+ * scale as the A/V killer: the AEC output at APP_INTERCOM_INPUT_GAIN 1 is the
+ * raw microphone scale, like the decoded stream audio the A/V thresholds were
+ * calibrated on. */
+#define APP_INTERCOM_HOWL_ENABLE            1
+#define APP_INTERCOM_HOWL_CLIP_LEVEL        30000   /* |sample| at/over this is "clipped" */
+#define APP_INTERCOM_HOWL_ON_CLIP_PERCENT   5U
+#define APP_INTERCOM_HOWL_ON_RMS            6000U
+#define APP_INTERCOM_HOWL_ON_FRAMES         3U      /* 30 ms */
+#define APP_INTERCOM_HOWL_OFF_CLIP_PERCENT  2U
+#define APP_INTERCOM_HOWL_OFF_RMS           4500U
+#define APP_INTERCOM_HOWL_OFF_FRAMES        50U     /* 500 ms, > one loop round trip */
+#define APP_INTERCOM_HOWL_MAX_MUTE_FRAMES   150U    /* 1.5 s hard cap on one mute */
 
 /* Use a shallow I2S ring during calls to keep the AEC reference aligned, and a
  * deep ring during camera operation to tolerate capture and encode latency. */
@@ -182,8 +204,20 @@
 /* Conceal one missing aggregated FLRC packet before resyncing. */
 #define APP_RX_MAX_PLC_FRAMES           APP_FLRC_OPUS_FRAMES_PER_PACKET
 
-/* Stop playback if no voice packet arrives within this interval. */
+/* Stop playback if no voice packet arrives within this interval. During a
+ * call only the playback state resets; the PA stays on until hang-up (see
+ * RadioPing::update_playback_timeout). */
 #define APP_RX_AUDIO_TIMEOUT_MS         200U
+
+/* During a call the play task never lets the speaker ring run dry: whenever
+ * less than this much written audio is left, it writes a concealment (later a
+ * silent) frame and feeds the same frame to the AEC reference. A dry ring
+ * plays cleared buffers the reference never saw and restarts at a new phase,
+ * which moves the echo the AEC has learnt. Keep it above two descriptors
+ * (30 ms at 240 frames): below that the IDF writer can find its half-filled
+ * descriptor next in line and skip the rest of it, a gap of zeros that is
+ * just as invisible to the reference. */
+#define APP_INTERCOM_PLAYOUT_GUARD_MS   35U
 
 /* Number of encoded voice packets buffered between radio RX and playback.
  * Sized for the one-way A/V stream, which is the bursty consumer: the audio for
@@ -317,6 +351,9 @@
 #define APP_CFG_KEY_PIR_TRIGGER         0x05
 #define APP_CFG_KEY_LOW_POWER           0x07
 #define APP_CFG_KEY_INTERCOM            0x08
+/* Value is the JPEG quality for every frame the node encodes; see
+ * APP_IMAGE_JPEG_QUALITY. */
+#define APP_CFG_KEY_JPEG_QUALITY        0x09
 /* Node: two PIR detections closer than this fire one capture. */
 #define APP_TRIGGER_COOLDOWN_SEC        15U
 #define APP_PIR_GPIO                    GPIO_NUM_12
@@ -357,8 +394,15 @@
 
 /* ----- Image transfer over FLRC ------------------------------------------ */
 
-/* JPEG quality 1-100; lower values reduce encode time and radio airtime. */
+/* JPEG quality 1-100; lower values reduce encode time and radio airtime.
+ * This is the door station's default; the gateway Settings page changes it
+ * over a CONFIG packet (APP_CFG_KEY_JPEG_QUALITY) and the node keeps it in
+ * NVS. The page steps through MIN..MAX; the node accepts any value in that
+ * range. */
 #define APP_IMAGE_JPEG_QUALITY          25
+#define APP_IMAGE_JPEG_QUALITY_MIN      15
+#define APP_IMAGE_JPEG_QUALITY_MAX      95
+#define APP_IMAGE_JPEG_QUALITY_STEP     10
 #define APP_IMAGE_FRAGMENT_DATA_SIZE    (APP_FLRC_MAX_PAYLOAD_BYTES - 16U)
 #define APP_IMAGE_TX_INTER_PACKET_US    0U
 #define APP_IMAGE_RX_TIMEOUT_MS         3000U

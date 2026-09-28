@@ -19,6 +19,11 @@ public:
                                     uint32_t width, uint32_t height, uint32_t pixfmt,
                                     uint8_t **out_jpeg, size_t *out_jpeg_len);
 
+    // TX side: quality for the next encode, clamped to the CONFIG range. Set
+    // from the radio task; each encode reads it once when it opens the encoder.
+    void set_jpeg_quality(uint8_t quality);
+    uint8_t jpeg_quality() const { return jpeg_quality_; }
+
     // RX side: start new reassembly session
     void rx_begin(uint16_t session_id, uint16_t total_fragments);
 
@@ -57,6 +62,7 @@ public:
     bool rx_complete() const { return rx_total_ > 0 && rx_received_ == rx_total_; }
 
 private:
+    volatile uint8_t jpeg_quality_ = APP_IMAGE_JPEG_QUALITY;
     uint8_t  *rx_buf_ = nullptr;
     uint16_t *rx_frag_lens_ = nullptr;
     bool     *rx_received_map_ = nullptr;
